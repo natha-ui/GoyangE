@@ -1,5 +1,7 @@
 # GoyangE
-NLP text to audio model
+NLP text to cat audio model
+![Uploading image.png…]()
+
 
 Model architecture:
 
