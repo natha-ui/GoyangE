@@ -6,7 +6,7 @@ df = pd.read_csv('your_file.csv')
 
 # Define the mapping
 intent_mapping = {
-    'weather_query': 'joy',
+    'agent_acquaintance': 'joy',
     'agent_annoying': 'fear',
     'agent_answer_my_question': 'anticipation/demanding',
     'agent_bad': 'fear',
@@ -48,7 +48,7 @@ intent_mapping = {
     'dialog_hug': 'joy',
     'dialog_i_do_not_care': 'fear',
     'dialog_sorry': 'anticipation/demanding',
-    'dialogue_what_do_you_mean': 'neutral',
+    'dialog_what_do_you_mean': 'neutral',
     'dialog_wrong': 'anticipation/demanding',
     'emotions_ha_ha': 'joy',
     'emotions_wow': 'joy',
@@ -89,7 +89,6 @@ intent_mapping = {
     'user_wants_to_see_agent_again': 'fear',
     'user_wants_to_talk': 'fear',
     'user_will_be_back': 'fear',
-    'agent_acquaitance': 'neutral',
     'agent_age': 'neutral'
 }
 
