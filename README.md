@@ -6,4 +6,4 @@ NLP text to cat audio model
 
 Model architecture:
 
-BPE -> Sentence Encoding (MiniLM) -> Intent classification (DistilBERT) -> Phonetic Alignment (Wav2Vec) -> Mel spectrogram -> GAN sound generation -> Fine-tuning
+BPE -> Sentence Encoding (MiniLM) -> Intent classification (DistilBERT) -> Mel spectrogram -> GAN sound generation -> Fine-tuning
