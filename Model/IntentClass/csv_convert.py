@@ -1,5 +1,6 @@
 import pandas as pd
 
+#for sample.csv from https://github.com/Beckendrof/intent-classification/blob/master/data/sample.csv
 # Load your CSV
 df = pd.read_csv('your_file.csv')
 
