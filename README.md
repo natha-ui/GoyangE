@@ -1,5 +1,5 @@
 # GoyangE
-NLP text to cat audio model
+NLP human text to cat audio model
 <img src="https://github.com/user-attachments/assets/925e2cfc-9a3f-402f-9053-384a77233d86" width="600">
 
 
