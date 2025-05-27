@@ -1,7 +1,6 @@
 # GoyangE
 NLP text to cat audio model
-![image](https://github.com/user-attachments/assets/925e2cfc-9a3f-402f-9053-384a77233d86)
-<img src="https://github.com/user-attachments/assets/925e2cfc-9a3f-402f-9053-384a77233d86" width="300">
+<img src="https://github.com/user-attachments/assets/925e2cfc-9a3f-402f-9053-384a77233d86" width="600">
 
 
 
