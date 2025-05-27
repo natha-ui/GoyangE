@@ -7,7 +7,7 @@ NLP text to cat audio model
 
 Model architecture:
 
-BPE -> Sentence Encoding (MiniLM) -> Intent classification (DistilBERT) -> Mel spectrogram -> GAN sound generation -> Fine-tuning
+BPE -> Intent classification (DistilBERT) -> Mel spectrogram -> WaveGAN sound generation -> Fine-tuning
 
 Dataset: 
 https://huggingface.co/datasets/zeddez/CatMeows Naming convention: Files containing meows are in the dataset.zip archive. They are PCM streams (.wav).
