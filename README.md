@@ -16,4 +16,4 @@ Naming conventions follow the pattern C_NNNNN_BB_SS_OOOOO_RXX, which has to be e
 
 C = emission context (values: B = brushing; F = waiting for food; I: isolation in an unfamiliar environment); NNNNN = cat’s unique ID; BB = breed (values: MC = Maine Coon; EU: European Shorthair); SS = sex (values: FI = female, intact; FN: female, neutered; MI: male, intact; MN: male, neutered); OOOOO = cat owner’s unique ID; R = recording session (values: 1, 2 or 3) XX = vocalization counter (values: 01..99)
 
-Emission context used for intent classification
+Emission context used for intent classification (B = joy, F = anticipation/demanding, I = fear)
