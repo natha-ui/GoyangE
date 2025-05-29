@@ -71,7 +71,7 @@ def apply_phaseshuffle(x, rad, pad_type='reflect'):
   phase_start = pad_r
   x = tf.pad(x, [[0, 0], [pad_l, pad_r], [0, 0]], mode=pad_type)
   x = x[:, phase_start:phase_start+x_len]
-  x.set_shape([b, x_len, nch]
+  x.set_shape([b, x_len, nch])
   return x
 
 
