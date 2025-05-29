@@ -30,9 +30,9 @@ if __name__ == '__main__':
     for fp in glob.glob(latest_ckpt + '*'):
       _, name = os.path.split(fp)
       backup_fp = os.path.join(backup_dir, name)
-      print('{}->{}'.format(fp, backup_fp))
+      print(f'{fp}->{backup_fp}')
       shutil.copyfile(fp, backup_fp)
     print('-' * 80)
 
-    # Sleep for an hour
+    # Sleep for the specified interval
     time.sleep(nsec)
