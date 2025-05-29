@@ -1,27 +1,15 @@
-from __future__ import print_function
-
-try:
-  import cPickle as pickle
-except:
-  import pickle
-from functools import reduce
+import tensorflow as tf
+import numpy as np
 import os
 import time
+from functools import reduce
 
-import numpy as np
-import tensorflow as tf
-from six.moves import xrange
-
-import loader
+from loader import decode_extract_and_batch
 from wavegan import WaveGANGenerator, WaveGANDiscriminator
 
-
-"""
-  Trains a WaveGAN
-"""
 def train(fps, args):
-  with tf.name_scope('loader'):
-    x = loader.decode_extract_and_batch(
+    # Create dataset
+    dataset = decode_extract_and_batch(
         fps,
         batch_size=args.train_batch_size,
         slice_len=args.data_slice_len,
@@ -29,184 +17,109 @@ def train(fps, args):
         decode_num_channels=args.data_num_channels,
         decode_fast_wav=args.data_fast_wav,
         decode_parallel_calls=4,
-        slice_randomize_offset=False if args.data_first_slice else True,
+        slice_randomize_offset=not args.data_first_slice,
         slice_first_only=args.data_first_slice,
         slice_overlap_ratio=0. if args.data_first_slice else args.data_overlap_ratio,
-        slice_pad_end=True if args.data_first_slice else args.data_pad_end,
+        slice_pad_end=args.data_first_slice or args.data_pad_end,
         repeat=True,
         shuffle=True,
         shuffle_buffer_size=4096,
         prefetch_size=args.train_batch_size * 4,
-        prefetch_gpu_num=args.data_prefetch_gpu_num)[:, :, 0]
+        prefetch_gpu_num=args.data_prefetch_gpu_num)
+    
+    dataset = dataset.map(lambda x: x[:, :, 0])  # Drop channel dim if 1D
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
-  # Make z vector
-  z = tf.random_uniform([args.train_batch_size, args.wavegan_latent_dim], -1., 1., dtype=tf.float32)
+    # Initialize models
+    generator = WaveGANGenerator(latent_dim=args.wavegan_latent_dim, **args.wavegan_g_kwargs)
+    discriminator = WaveGANDiscriminator(**args.wavegan_d_kwargs)
 
-  # Make generator
-  with tf.variable_scope('G'):
-    G_z = WaveGANGenerator(z, train=True, **args.wavegan_g_kwargs)
-    if args.wavegan_genr_pp:
-      with tf.variable_scope('pp_filt'):
-        G_z = tf.layers.conv1d(G_z, 1, args.wavegan_genr_pp_len, use_bias=False, padding='same')
-  G_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='G')
+    # Optimizers
+    if args.wavegan_loss == 'dcgan':
+        g_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+        d_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+    elif args.wavegan_loss == 'lsgan':
+        g_optimizer = tf.keras.optimizers.RMSprop(1e-4)
+        d_optimizer = tf.keras.optimizers.RMSprop(1e-4)
+    elif args.wavegan_loss == 'wgan':
+        g_optimizer = tf.keras.optimizers.RMSprop(5e-5)
+        d_optimizer = tf.keras.optimizers.RMSprop(5e-5)
+    elif args.wavegan_loss == 'wgan-gp':
+        g_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5, beta_2=0.9)
+        d_optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.5, beta_2=0.9)
+    else:
+        raise NotImplementedError()
 
-  # Print G summary
-  print('-' * 80)
-  print('Generator vars')
-  nparams = 0
-  for v in G_vars:
-    v_shape = v.get_shape().as_list()
-    v_n = reduce(lambda x, y: x * y, v_shape)
-    nparams += v_n
-    print('{} ({}): {}'.format(v.get_shape().as_list(), v_n, v.name))
-  print('Total params: {} ({:.2f} MB)'.format(nparams, (float(nparams) * 4) / (1024 * 1024)))
+    summary_writer = tf.summary.create_file_writer(args.train_dir)
+    global_step = 0
 
-  # Summarize
-  tf.summary.audio('x', x, args.data_sample_rate)
-  tf.summary.audio('G_z', G_z, args.data_sample_rate)
-  G_z_rms = tf.sqrt(tf.reduce_mean(tf.square(G_z[:, :, 0]), axis=1))
-  x_rms = tf.sqrt(tf.reduce_mean(tf.square(x[:, :, 0]), axis=1))
-  tf.summary.histogram('x_rms_batch', x_rms)
-  tf.summary.histogram('G_z_rms_batch', G_z_rms)
-  tf.summary.scalar('x_rms', tf.reduce_mean(x_rms))
-  tf.summary.scalar('G_z_rms', tf.reduce_mean(G_z_rms))
+    @tf.function
+    def train_step(x_batch):
+        nonlocal global_step
 
-  # Make real discriminator
-  with tf.name_scope('D_x'), tf.variable_scope('D'):
-    D_x = WaveGANDiscriminator(x, **args.wavegan_d_kwargs)
-  D_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='D')
+        # Sample z
+        z = tf.random.uniform([args.train_batch_size, args.wavegan_latent_dim], -1., 1.)
 
-  # Print D summary
-  print('-' * 80)
-  print('Discriminator vars')
-  nparams = 0
-  for v in D_vars:
-    v_shape = v.get_shape().as_list()
-    v_n = reduce(lambda x, y: x * y, v_shape)
-    nparams += v_n
-    print('{} ({}): {}'.format(v.get_shape().as_list(), v_n, v.name))
-  print('Total params: {} ({:.2f} MB)'.format(nparams, (float(nparams) * 4) / (1024 * 1024)))
-  print('-' * 80)
+        # Train discriminator
+        for _ in range(args.wavegan_disc_nupdates):
+            with tf.GradientTape() as d_tape:
+                G_z = generator(z, training=True)
+                D_x = discriminator(x_batch, training=True)
+                D_G_z = discriminator(G_z, training=True)
 
-  # Make fake discriminator
-  with tf.name_scope('D_G_z'), tf.variable_scope('D', reuse=True):
-    D_G_z = WaveGANDiscriminator(G_z, **args.wavegan_d_kwargs)
+                if args.wavegan_loss == 'dcgan':
+                    real_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=D_x, labels=tf.ones_like(D_x))
+                    fake_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=D_G_z, labels=tf.zeros_like(D_G_z))
+                    d_loss = tf.reduce_mean(real_loss) + tf.reduce_mean(fake_loss)
+                elif args.wavegan_loss == 'lsgan':
+                    d_loss = 0.5 * (tf.reduce_mean((D_x - 1)**2) + tf.reduce_mean(D_G_z**2))
+                elif args.wavegan_loss == 'wgan':
+                    d_loss = tf.reduce_mean(D_G_z) - tf.reduce_mean(D_x)
+                elif args.wavegan_loss == 'wgan-gp':
+                    alpha = tf.random.uniform([args.train_batch_size, 1, 1], 0.0, 1.0)
+                    interpolates = x_batch + alpha * (G_z - x_batch)
+                    with tf.GradientTape() as gp_tape:
+                        gp_tape.watch(interpolates)
+                        D_interp = discriminator(interpolates, training=True)
+                    grads = gp_tape.gradient(D_interp, [interpolates])[0]
+                    slopes = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2]))
+                    gp = tf.reduce_mean((slopes - 1.0)**2)
+                    d_loss = tf.reduce_mean(D_G_z) - tf.reduce_mean(D_x) + 10 * gp
 
-  # Create loss
-  D_clip_weights = None
-  if args.wavegan_loss == 'dcgan':
-    fake = tf.zeros([args.train_batch_size], dtype=tf.float32)
-    real = tf.ones([args.train_batch_size], dtype=tf.float32)
+            d_gradients = d_tape.gradient(d_loss, discriminator.trainable_variables)
+            d_optimizer.apply_gradients(zip(d_gradients, discriminator.trainable_variables))
 
-    G_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-      logits=D_G_z,
-      labels=real
-    ))
+            if args.wavegan_loss == 'wgan':
+                for var in discriminator.trainable_variables:
+                    var.assign(tf.clip_by_value(var, -0.01, 0.01))
 
-    D_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-      logits=D_G_z,
-      labels=fake
-    ))
-    D_loss += tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
-      logits=D_x,
-      labels=real
-    ))
+        # Train generator
+        with tf.GradientTape() as g_tape:
+            G_z = generator(z, training=True)
+            D_G_z = discriminator(G_z, training=True)
 
-    D_loss /= 2.
-  elif args.wavegan_loss == 'lsgan':
-    G_loss = tf.reduce_mean((D_G_z - 1.) ** 2)
-    D_loss = tf.reduce_mean((D_x - 1.) ** 2)
-    D_loss += tf.reduce_mean(D_G_z ** 2)
-    D_loss /= 2.
-  elif args.wavegan_loss == 'wgan':
-    G_loss = -tf.reduce_mean(D_G_z)
-    D_loss = tf.reduce_mean(D_G_z) - tf.reduce_mean(D_x)
+            if args.wavegan_loss in ['dcgan', 'lsgan']:
+                if args.wavegan_loss == 'dcgan':
+                    g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+                        logits=D_G_z, labels=tf.ones_like(D_G_z)))
+                elif args.wavegan_loss == 'lsgan':
+                    g_loss = 0.5 * tf.reduce_mean((D_G_z - 1)**2)
+            elif args.wavegan_loss in ['wgan', 'wgan-gp']:
+                g_loss = -tf.reduce_mean(D_G_z)
 
-    with tf.name_scope('D_clip_weights'):
-      clip_ops = []
-      for var in D_vars:
-        clip_bounds = [-.01, .01]
-        clip_ops.append(
-          tf.assign(
-            var,
-            tf.clip_by_value(var, clip_bounds[0], clip_bounds[1])
-          )
-        )
-      D_clip_weights = tf.group(*clip_ops)
-  elif args.wavegan_loss == 'wgan-gp':
-    G_loss = -tf.reduce_mean(D_G_z)
-    D_loss = tf.reduce_mean(D_G_z) - tf.reduce_mean(D_x)
+        g_gradients = g_tape.gradient(g_loss, generator.trainable_variables)
+        g_optimizer.apply_gradients(zip(g_gradients, generator.trainable_variables))
 
-    alpha = tf.random_uniform(shape=[args.train_batch_size, 1, 1], minval=0., maxval=1.)
-    differences = G_z - x
-    interpolates = x + (alpha * differences)
-    with tf.name_scope('D_interp'), tf.variable_scope('D', reuse=True):
-      D_interp = WaveGANDiscriminator(interpolates, **args.wavegan_d_kwargs)
+        with summary_writer.as_default():
+            tf.summary.scalar('G_loss', g_loss, step=global_step)
+            tf.summary.scalar('D_loss', d_loss, step=global_step)
+        global_step += 1
 
-    LAMBDA = 10
-    gradients = tf.gradients(D_interp, [interpolates])[0]
-    slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), reduction_indices=[1, 2]))
-    gradient_penalty = tf.reduce_mean((slopes - 1.) ** 2.)
-    D_loss += LAMBDA * gradient_penalty
-  else:
-    raise NotImplementedError()
+    # Training loop
+    print("Starting training...")
+    for batch in dataset:
+        train_step(batch)
 
-  tf.summary.scalar('G_loss', G_loss)
-  tf.summary.scalar('D_loss', D_loss)
-
-  # Create (recommended) optimizer
-  if args.wavegan_loss == 'dcgan':
-    G_opt = tf.train.AdamOptimizer(
-        learning_rate=2e-4,
-        beta1=0.5)
-    D_opt = tf.train.AdamOptimizer(
-        learning_rate=2e-4,
-        beta1=0.5)
-  elif args.wavegan_loss == 'lsgan':
-    G_opt = tf.train.RMSPropOptimizer(
-        learning_rate=1e-4)
-    D_opt = tf.train.RMSPropOptimizer(
-        learning_rate=1e-4)
-  elif args.wavegan_loss == 'wgan':
-    G_opt = tf.train.RMSPropOptimizer(
-        learning_rate=5e-5)
-    D_opt = tf.train.RMSPropOptimizer(
-        learning_rate=5e-5)
-  elif args.wavegan_loss == 'wgan-gp':
-    G_opt = tf.train.AdamOptimizer(
-        learning_rate=1e-4,
-        beta1=0.5,
-        beta2=0.9)
-    D_opt = tf.train.AdamOptimizer(
-        learning_rate=1e-4,
-        beta1=0.5,
-        beta2=0.9)
-  else:
-    raise NotImplementedError()
-
-  # Create training ops
-  G_train_op = G_opt.minimize(G_loss, var_list=G_vars,
-      global_step=tf.train.get_or_create_global_step())
-  D_train_op = D_opt.minimize(D_loss, var_list=D_vars)
-
-  # Run training
-  with tf.train.MonitoredTrainingSession(
-      checkpoint_dir=args.train_dir,
-      save_checkpoint_secs=args.train_save_secs,
-      save_summaries_secs=args.train_summary_secs) as sess:
-    print('-' * 80)
-    print('Training has started. Please use \'tensorboard --logdir={}\' to monitor.'.format(args.train_dir))
-    while True:
-      # Train discriminator
-      for i in xrange(args.wavegan_disc_nupdates):
-        sess.run(D_train_op)
-
-        # Enforce Lipschitz constraint for WGAN
-        if D_clip_weights is not None:
-          sess.run(D_clip_weights)
-
-      # Train generator
-      sess.run(G_train_op)
 
 
 """
@@ -235,428 +148,455 @@ def train(fps, args):
     z = graph.get_tensor_by_name('G_z:0')
     _G_z = sess.run(graph.get_tensor_by_name('G_z:0'), {z: _z})
 """
+import os
+import numpy as np
+import tensorflow as tf
+from wavegan import WaveGANGenerator
+
+def float_to_int16(x):
+    x = x * 32767.0
+    x = tf.clip_by_value(x, -32767.0, 32767.0)
+    return tf.cast(x, tf.int16)
+
 def infer(args):
-  infer_dir = os.path.join(args.train_dir, 'infer')
-  if not os.path.isdir(infer_dir):
-    os.makedirs(infer_dir)
+    infer_dir = os.path.join(args.train_dir, 'infer')
+    os.makedirs(infer_dir, exist_ok=True)
 
-  # Subgraph that generates latent vectors
-  samp_z_n = tf.placeholder(tf.int32, [], name='samp_z_n')
-  samp_z = tf.random_uniform([samp_z_n, args.wavegan_latent_dim], -1.0, 1.0, dtype=tf.float32, name='samp_z')
+    # Create the generator
+    generator = WaveGANGenerator(latent_dim=args.wavegan_latent_dim, **args.wavegan_g_kwargs)
+    dummy_z = tf.random.uniform([1, args.wavegan_latent_dim], -1.0, 1.0)
+    _ = generator(dummy_z, training=False)  # Build model
 
-  # Input zo
-  z = tf.placeholder(tf.float32, [None, args.wavegan_latent_dim], name='z')
-  flat_pad = tf.placeholder(tf.int32, [], name='flat_pad')
-
-  # Execute generator
-  with tf.variable_scope('G'):
-    G_z = WaveGANGenerator(z, train=False, **args.wavegan_g_kwargs)
+    # Optionally add post-processing filter
     if args.wavegan_genr_pp:
-      with tf.variable_scope('pp_filt'):
-        G_z = tf.layers.conv1d(G_z, 1, args.wavegan_genr_pp_len, use_bias=False, padding='same')
-  G_z = tf.identity(G_z, name='G_z')
+        pp_filter = tf.keras.layers.Conv1D(
+            filters=1,
+            kernel_size=args.wavegan_genr_pp_len,
+            padding='same',
+            use_bias=False,
+            name='pp_filt'
+        )
 
-  # Flatten batch
-  nch = int(G_z.get_shape()[-1])
-  G_z_padded = tf.pad(G_z, [[0, 0], [0, flat_pad], [0, 0]])
-  G_z_flat = tf.reshape(G_z_padded, [-1, nch], name='G_z_flat')
+        # Run dummy data through to build
+        _ = pp_filter(generator(dummy_z, training=False))
+    else:
+        pp_filter = None
 
-  # Encode to int16
-  def float_to_int16(x, name=None):
-    x_int16 = x * 32767.
-    x_int16 = tf.clip_by_value(x_int16, -32767., 32767.)
-    x_int16 = tf.cast(x_int16, tf.int16, name=name)
-    return x_int16
-  G_z_int16 = float_to_int16(G_z, name='G_z_int16')
-  G_z_flat_int16 = float_to_int16(G_z_flat, name='G_z_flat_int16')
+    # Sample latent vectors
+    def sample_latents(n):
+        return tf.random.uniform([n, args.wavegan_latent_dim], -1.0, 1.0)
 
-  # Create saver
-  G_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='G')
-  global_step = tf.train.get_or_create_global_step()
-  saver = tf.train.Saver(G_vars + [global_step])
+    def generate_audio(z, flat_pad=0):
+        G_z = generator(z, training=False)
+        if pp_filter is not None:
+            G_z = pp_filter(G_z)
 
-  # Export graph
-  tf.train.write_graph(tf.get_default_graph(), infer_dir, 'infer.pbtxt')
+        nch = G_z.shape[-1]
+        G_z_padded = tf.pad(G_z, [[0, 0], [0, flat_pad], [0, 0]])
+        G_z_flat = tf.reshape(G_z_padded, [-1, nch])
 
-  # Export MetaGraph
-  infer_metagraph_fp = os.path.join(infer_dir, 'infer.meta')
-  tf.train.export_meta_graph(
-      filename=infer_metagraph_fp,
-      clear_devices=True,
-      saver_def=saver.as_saver_def())
+        G_z_int16 = float_to_int16(G_z)
+        G_z_flat_int16 = float_to_int16(G_z_flat)
 
-  # Reset graph (in case training afterwards)
-  tf.reset_default_graph()
+        return G_z, G_z_int16, G_z_flat_int16
+
+    # Save weights
+    checkpoint = tf.train.Checkpoint(generator=generator)
+    if pp_filter is not None:
+        checkpoint.pp_filter = pp_filter
+    manager = tf.train.CheckpointManager(checkpoint, directory=infer_dir, max_to_keep=1)
+    manager.save()
+
+    print(f"Generator weights saved to {infer_dir}")
+    print("You can restore them with tf.train.Checkpoint and generate audio with `generate_audio(z)`.")
 
 
 """
   Generates a preview audio file every time a checkpoint is saved
 """
+import os
+import time
+import pickle
+import numpy as np
+import tensorflow as tf
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.io.wavfile import write as wavwrite
+from scipy.signal import freqz
+
 def preview(args):
-  import matplotlib
-  matplotlib.use('Agg')
-  import matplotlib.pyplot as plt
-  from scipy.io.wavfile import write as wavwrite
-  from scipy.signal import freqz
+    preview_dir = os.path.join(args.train_dir, 'preview')
+    os.makedirs(preview_dir, exist_ok=True)
 
-  preview_dir = os.path.join(args.train_dir, 'preview')
-  if not os.path.isdir(preview_dir):
-    os.makedirs(preview_dir)
+    # Load or generate latent vectors _zs
+    z_fp = os.path.join(preview_dir, 'z.pkl')
+    if os.path.exists(z_fp):
+        with open(z_fp, 'rb') as f:
+            _zs = pickle.load(f)
+    else:
+        _zs = tf.random.uniform([args.preview_n, args.wavegan_latent_dim], -1.0, 1.0)
+        _zs = _zs.numpy()
+        with open(z_fp, 'wb') as f:
+            pickle.dump(_zs, f)
 
-  # Load graph
-  infer_metagraph_fp = os.path.join(args.train_dir, 'infer', 'infer.meta')
-  graph = tf.get_default_graph()
-  saver = tf.train.import_meta_graph(infer_metagraph_fp)
+    # Load generator model checkpoint
+    infer_dir = os.path.join(args.train_dir, 'infer')
+    checkpoint_dir = infer_dir
+    generator = args.generator  # Assume the generator model is passed as part of args
+    pp_filter = None
 
-  # Generate or restore z_i and z_o
-  z_fp = os.path.join(preview_dir, 'z.pkl')
-  if os.path.exists(z_fp):
-    with open(z_fp, 'rb') as f:
-      _zs = pickle.load(f)
-  else:
-    # Sample z
-    samp_feeds = {}
-    samp_feeds[graph.get_tensor_by_name('samp_z_n:0')] = args.preview_n
-    samp_fetches = {}
-    samp_fetches['zs'] = graph.get_tensor_by_name('samp_z:0')
-    with tf.Session() as sess:
-      _samp_fetches = sess.run(samp_fetches, samp_feeds)
-    _zs = _samp_fetches['zs']
+    # Optionally create pp_filter layer if enabled
+    if args.wavegan_genr_pp:
+        pp_filter = tf.keras.layers.Conv1D(
+            filters=1,
+            kernel_size=args.wavegan_genr_pp_len,
+            padding='same',
+            use_bias=False,
+            name='pp_filt'
+        )
+        # Build pp_filter with dummy input to initialize weights
+        dummy_input = tf.zeros((1, 16384, generator.output_shape[-1]))
+        _ = pp_filter(dummy_input)
 
-    # Save z
-    with open(z_fp, 'wb') as f:
-      pickle.dump(_zs, f)
+    # Setup checkpoint
+    checkpoint = tf.train.Checkpoint(generator=generator)
+    if pp_filter is not None:
+        checkpoint.pp_filter = pp_filter
+    manager = tf.train.CheckpointManager(checkpoint, checkpoint_dir, max_to_keep=1)
 
-  # Set up graph for generating preview images
-  feeds = {}
-  feeds[graph.get_tensor_by_name('z:0')] = _zs
-  feeds[graph.get_tensor_by_name('flat_pad:0')] = int(args.data_sample_rate / 2)
-  fetches = {}
-  fetches['step'] = tf.train.get_or_create_global_step()
-  fetches['G_z'] = graph.get_tensor_by_name('G_z:0')
-  fetches['G_z_flat_int16'] = graph.get_tensor_by_name('G_z_flat_int16:0')
-  if args.wavegan_genr_pp:
-    fetches['pp_filter'] = graph.get_tensor_by_name('G/pp_filt/conv1d/kernel:0')[:, 0, 0]
+    # Setup TensorBoard summary writer
+    summary_writer = tf.summary.create_file_writer(preview_dir)
 
-  # Summarize
-  G_z = graph.get_tensor_by_name('G_z_flat:0')
-  summaries = [
-      tf.summary.audio('preview', tf.expand_dims(G_z, axis=0), args.data_sample_rate, max_outputs=1)
-  ]
-  fetches['summaries'] = tf.summary.merge(summaries)
-  summary_writer = tf.summary.FileWriter(preview_dir)
+    # Helper function to generate audio and optionally apply pp_filter
+    def generate_audio(z_batch, flat_pad):
+        G_z = generator(z_batch, training=False)  # [batch, time, channels]
+        if pp_filter is not None:
+            G_z = pp_filter(G_z)
+        # Pad in time dimension
+        G_z_padded = tf.pad(G_z, [[0, 0], [0, flat_pad], [0, 0]])
+        nch = G_z.shape[-1]
+        G_z_flat = tf.reshape(G_z_padded, [-1, nch])
 
-  # PP Summarize
-  if args.wavegan_genr_pp:
-    pp_fp = tf.placeholder(tf.string, [])
-    pp_bin = tf.read_file(pp_fp)
-    pp_png = tf.image.decode_png(pp_bin)
-    pp_summary = tf.summary.image('pp_filt', tf.expand_dims(pp_png, axis=0))
+        def float_to_int16(x):
+            x = x * 32767.0
+            x = tf.clip_by_value(x, -32767.0, 32767.0)
+            return tf.cast(x, tf.int16)
 
-  # Loop, waiting for checkpoints
-  ckpt_fp = None
-  while True:
-    latest_ckpt_fp = tf.train.latest_checkpoint(args.train_dir)
-    if latest_ckpt_fp != ckpt_fp:
-      print('Preview: {}'.format(latest_ckpt_fp))
+        G_z_int16 = float_to_int16(G_z)
+        G_z_flat_int16 = float_to_int16(G_z_flat)
+        return G_z, G_z_int16, G_z_flat_int16
 
-      with tf.Session() as sess:
-        saver.restore(sess, latest_ckpt_fp)
+    print("Starting preview loop...")
+    last_ckpt_fp = None
 
-        _fetches = sess.run(fetches, feeds)
+    while True:
+        latest_ckpt_fp = manager.latest_checkpoint
+        if latest_ckpt_fp is not None and latest_ckpt_fp != last_ckpt_fp:
+            print(f'Preview: {latest_ckpt_fp}')
+            # Restore checkpoint
+            checkpoint.restore(latest_ckpt_fp).expect_partial()
 
-        _step = _fetches['step']
+            flat_pad = int(args.data_sample_rate / 2)
+            z_tensor = tf.convert_to_tensor(_zs, dtype=tf.float32)
 
-      preview_fp = os.path.join(preview_dir, '{}.wav'.format(str(_step).zfill(8)))
-      wavwrite(preview_fp, args.data_sample_rate, _fetches['G_z_flat_int16'])
+            G_z, G_z_int16, G_z_flat_int16 = generate_audio(z_tensor, flat_pad)
 
-      summary_writer.add_summary(_fetches['summaries'], _step)
+            # Save WAV files for each sample
+            step_num = int(latest_ckpt_fp.split('-')[-1])  # extract step from checkpoint name
 
-      if args.wavegan_genr_pp:
-        w, h = freqz(_fetches['pp_filter'])
+            for i in range(args.preview_n):
+                preview_fp = os.path.join(preview_dir, f'{str(step_num).zfill(8)}_{i}.wav')
+                wavwrite(preview_fp, args.data_sample_rate, G_z_flat_int16.numpy()[i])
 
-        fig = plt.figure()
-        plt.title('Digital filter frequncy response')
-        ax1 = fig.add_subplot(111)
+            # Write TensorBoard audio summary (only first sample)
+            with summary_writer.as_default():
+                audio = tf.expand_dims(G_z_flat_int16[0], axis=0)
+                audio = tf.cast(audio, tf.float32) / 32767.0  # normalize for summary.audio
+                tf.summary.audio('preview_audio', audio, sample_rate=args.data_sample_rate, step=step_num, max_outputs=1)
 
-        plt.plot(w, 20 * np.log10(abs(h)), 'b')
-        plt.ylabel('Amplitude [dB]', color='b')
-        plt.xlabel('Frequency [rad/sample]')
+            # Plot and save post-processing filter frequency response if enabled
+            if args.wavegan_genr_pp:
+                pp_kernel = pp_filter.weights[0].numpy()[:, 0, 0]
+                w, h = freqz(pp_kernel)
 
-        ax2 = ax1.twinx()
-        angles = np.unwrap(np.angle(h))
-        plt.plot(w, angles, 'g')
-        plt.ylabel('Angle (radians)', color='g')
-        plt.grid()
-        plt.axis('tight')
+                plt.figure()
+                plt.title('Digital filter frequency response')
+                plt.plot(w, 20 * np.log10(np.abs(h)), 'b')
+                plt.ylabel('Amplitude [dB]', color='b')
+                plt.xlabel('Frequency [rad/sample]')
 
-        _pp_fp = os.path.join(preview_dir, '{}_ppfilt.png'.format(str(_step).zfill(8)))
-        plt.savefig(_pp_fp)
+                ax2 = plt.gca().twinx()
+                angles = np.unwrap(np.angle(h))
+                ax2.plot(w, angles, 'g')
+                ax2.set_ylabel('Angle (radians)', color='g')
+                plt.grid()
+                plt.axis('tight')
 
-        with tf.Session() as sess:
-          _summary = sess.run(pp_summary, {pp_fp: _pp_fp})
-          summary_writer.add_summary(_summary, _step)
+                pp_img_fp = os.path.join(preview_dir, f'{str(step_num).zfill(8)}_ppfilt.png')
+                plt.savefig(pp_img_fp)
+                plt.close()
 
-      print('Done')
+                # Log image summary
+                img = plt.imread(pp_img_fp)
+                with summary_writer.as_default():
+                    tf.summary.image('pp_filt', tf.expand_dims(img, axis=0), step=step_num)
 
-      ckpt_fp = latest_ckpt_fp
+            print('Done')
 
-    time.sleep(1)
+            last_ckpt_fp = latest_ckpt_fp
+
+        time.sleep(1)
 
 
 """
   Computes inception score every time a checkpoint is saved
 """
+import os
+import time
+import pickle
+import numpy as np
+import tensorflow as tf
+
 def incept(args):
-  incept_dir = os.path.join(args.train_dir, 'incept')
-  if not os.path.isdir(incept_dir):
-    os.makedirs(incept_dir)
+    incept_dir = os.path.join(args.train_dir, 'incept')
+    os.makedirs(incept_dir, exist_ok=True)
 
-  # Load GAN graph
-  gan_graph = tf.Graph()
-  with gan_graph.as_default():
-    infer_metagraph_fp = os.path.join(args.train_dir, 'infer', 'infer.meta')
-    gan_saver = tf.train.import_meta_graph(infer_metagraph_fp)
-    score_saver = tf.train.Saver(max_to_keep=1)
-  gan_z = gan_graph.get_tensor_by_name('z:0')
-  gan_G_z = gan_graph.get_tensor_by_name('G_z:0')[:, :, 0]
-  gan_step = gan_graph.get_tensor_by_name('global_step:0')
+    # Load or generate latent vectors _zs
+    z_fp = os.path.join(incept_dir, 'z.pkl')
+    if os.path.exists(z_fp):
+        with open(z_fp, 'rb') as f:
+            _zs = pickle.load(f)
+    else:
+        _zs = tf.random.uniform([args.incept_n, args.wavegan_latent_dim], -1.0, 1.0)
+        _zs = _zs.numpy()
+        with open(z_fp, 'wb') as f:
+            pickle.dump(_zs, f)
 
-  # Load or generate latents
-  z_fp = os.path.join(incept_dir, 'z.pkl')
-  if os.path.exists(z_fp):
-    with open(z_fp, 'rb') as f:
-      _zs = pickle.load(f)
-  else:
-    gan_samp_z_n = gan_graph.get_tensor_by_name('samp_z_n:0')
-    gan_samp_z = gan_graph.get_tensor_by_name('samp_z:0')
-    with tf.Session(graph=gan_graph) as sess:
-      _zs = sess.run(gan_samp_z, {gan_samp_z_n: args.incept_n})
-    with open(z_fp, 'wb') as f:
-      pickle.dump(_zs, f)
+    # Load Generator (GAN) model
+    generator = args.generator  # Assume generator model (tf.keras.Model) passed in args
+    checkpoint_dir = os.path.join(args.train_dir, 'infer')
+    checkpoint = tf.train.Checkpoint(generator=generator)
+    manager = tf.train.CheckpointManager(checkpoint, checkpoint_dir, max_to_keep=1)
 
-  # Load classifier graph
-  incept_graph = tf.Graph()
-  with incept_graph.as_default():
-    incept_saver = tf.train.import_meta_graph(args.incept_metagraph_fp)
-  incept_x = incept_graph.get_tensor_by_name('x:0')
-  incept_preds = incept_graph.get_tensor_by_name('scores:0')
-  incept_sess = tf.Session(graph=incept_graph)
-  incept_saver.restore(incept_sess, args.incept_ckpt_fp)
+    # Load classifier model (Inception)
+    classifier = args.classifier  # Assume classifier model (tf.keras.Model) passed in args
+    classifier_ckpt = args.incept_ckpt_fp
+    classifier_checkpoint = tf.train.Checkpoint(classifier=classifier)
+    classifier_checkpoint.restore(classifier_ckpt).expect_partial()
 
-  # Create summaries
-  summary_graph = tf.Graph()
-  with summary_graph.as_default():
-    incept_mean = tf.placeholder(tf.float32, [])
-    incept_std = tf.placeholder(tf.float32, [])
-    summaries = [
-        tf.summary.scalar('incept_mean', incept_mean),
-        tf.summary.scalar('incept_std', incept_std)
-    ]
-    summaries = tf.summary.merge(summaries)
-  summary_writer = tf.summary.FileWriter(incept_dir)
+    summary_writer = tf.summary.create_file_writer(incept_dir)
 
-  # Loop, waiting for checkpoints
-  ckpt_fp = None
-  _best_score = 0.
-  while True:
-    latest_ckpt_fp = tf.train.latest_checkpoint(args.train_dir)
-    if latest_ckpt_fp != ckpt_fp:
-      print('Incept: {}'.format(latest_ckpt_fp))
+    best_score = 0.0
+    last_ckpt_fp = None
 
-      sess = tf.Session(graph=gan_graph)
+    batch_size = 100
 
-      gan_saver.restore(sess, latest_ckpt_fp)
+    while True:
+        latest_ckpt_fp = manager.latest_checkpoint
+        if latest_ckpt_fp is not None and latest_ckpt_fp != last_ckpt_fp:
+            print(f'Incept: {latest_ckpt_fp}')
+            checkpoint.restore(latest_ckpt_fp).expect_partial()
 
-      _step = sess.run(gan_step)
+            step_num = int(latest_ckpt_fp.split('-')[-1])
 
-      _G_zs = []
-      for i in xrange(0, args.incept_n, 100):
-        _G_zs.append(sess.run(gan_G_z, {gan_z: _zs[i:i+100]}))
-      _G_zs = np.concatenate(_G_zs, axis=0)
+            # Generate fake samples in batches
+            G_zs = []
+            for i in range(0, args.incept_n, batch_size):
+                z_batch = tf.convert_to_tensor(_zs[i:i + batch_size], dtype=tf.float32)
+                generated = generator(z_batch, training=False)  # [batch, time, channels]
+                # Extract first channel as in original: [:, :, 0]
+                generated = generated[:, :, 0].numpy()
+                G_zs.append(generated)
+            G_zs = np.concatenate(G_zs, axis=0)
 
-      _preds = []
-      for i in xrange(0, args.incept_n, 100):
-        _preds.append(incept_sess.run(incept_preds, {incept_x: _G_zs[i:i+100]}))
-      _preds = np.concatenate(_preds, axis=0)
+            # Classify generated samples in batches
+            preds = []
+            for i in range(0, args.incept_n, batch_size):
+                batch = tf.convert_to_tensor(G_zs[i:i + batch_size], dtype=tf.float32)
+                batch = tf.expand_dims(batch, -1)  # Add channel dim if classifier expects it
+                pred = classifier(batch, training=False).numpy()
+                preds.append(pred)
+            preds = np.concatenate(preds, axis=0)
 
-      # Split into k groups
-      _incept_scores = []
-      split_size = args.incept_n // args.incept_k
-      for i in xrange(args.incept_k):
-        _split = _preds[i * split_size:(i + 1) * split_size]
-        _kl = _split * (np.log(_split) - np.log(np.expand_dims(np.mean(_split, 0), 0)))
-        _kl = np.mean(np.sum(_kl, 1))
-        _incept_scores.append(np.exp(_kl))
+            # Compute Inception Score
+            split_size = args.incept_n // args.incept_k
+            incept_scores = []
+            for i in range(args.incept_k):
+                split = preds[i * split_size:(i + 1) * split_size]
+                py = np.mean(split, axis=0, keepdims=True)
+                kl = split * (np.log(split + 1e-16) - np.log(py + 1e-16))
+                kl = np.mean(np.sum(kl, axis=1))
+                incept_scores.append(np.exp(kl))
 
-      _incept_mean, _incept_std = np.mean(_incept_scores), np.std(_incept_scores)
+            incept_mean = np.mean(incept_scores)
+            incept_std = np.std(incept_scores)
 
-      # Summarize
-      with tf.Session(graph=summary_graph) as summary_sess:
-        _summaries = summary_sess.run(summaries, {incept_mean: _incept_mean, incept_std: _incept_std})
-      summary_writer.add_summary(_summaries, _step)
+            # Write summaries
+            with summary_writer.as_default():
+                tf.summary.scalar('incept_mean', incept_mean, step=step_num)
+                tf.summary.scalar('incept_std', incept_std, step=step_num)
 
-      # Save
-      if _incept_mean > _best_score:
-        score_saver.save(sess, os.path.join(incept_dir, 'best_score'), _step)
-        _best_score = _incept_mean
+            # Save best score checkpoint
+            if incept_mean > best_score:
+                checkpoint_path = os.path.join(incept_dir, 'best_score')
+                checkpoint.write(checkpoint_path)
+                best_score = incept_mean
 
-      sess.close()
+            print(f'Step {step_num} done - Incept mean: {incept_mean:.4f}, std: {incept_std:.4f}')
 
-      print('Done')
+            last_ckpt_fp = latest_ckpt_fp
 
-      ckpt_fp = latest_ckpt_fp
-
-    time.sleep(1)
-
-  incept_sess.close()
+        time.sleep(1)
 
 
-if __name__ == '__main__':
-  import argparse
-  import glob
-  import sys
+import os
+import glob
+import tensorflow as tf
+from tensorflow.keras import layers
 
-  parser = argparse.ArgumentParser()
+# Your conv1d_transpose, WaveGANGenerator, lrelu, apply_phaseshuffle, WaveGANDiscriminator
+# are assumed imported here or defined above this script
 
-  parser.add_argument('mode', type=str, choices=['train', 'preview', 'incept', 'infer'])
-  parser.add_argument('train_dir', type=str,
-      help='Training directory')
+def train(filepaths, args):
+    # Your train loop here using tf.GradientTape etc.
+    print("Starting training with {} files...".format(len(filepaths)))
+    # Example dummy training step (replace with your actual training)
+    # ...
+    pass
 
-  data_args = parser.add_argument_group('Data')
-  data_args.add_argument('--data_dir', type=str,
-      help='Data directory containing *only* audio files to load')
-  data_args.add_argument('--data_sample_rate', type=int,
-      help='Number of audio samples per second')
-  data_args.add_argument('--data_slice_len', type=int, choices=[16384, 32768, 65536],
-      help='Number of audio samples per slice (maximum generation length)')
-  data_args.add_argument('--data_num_channels', type=int,
-      help='Number of audio channels to generate (for >2, must match that of data)')
-  data_args.add_argument('--data_overlap_ratio', type=float,
-      help='Overlap ratio [0, 1) between slices')
-  data_args.add_argument('--data_first_slice', action='store_true', dest='data_first_slice',
-      help='If set, only use the first slice each audio example')
-  data_args.add_argument('--data_pad_end', action='store_true', dest='data_pad_end',
-      help='If set, use zero-padded partial slices from the end of each audio file')
-  data_args.add_argument('--data_normalize', action='store_true', dest='data_normalize',
-      help='If set, normalize the training examples')
-  data_args.add_argument('--data_fast_wav', action='store_true', dest='data_fast_wav',
-      help='If your data is comprised of standard WAV files (16-bit signed PCM or 32-bit float), use this flag to decode audio using scipy (faster) instead of librosa')
-  data_args.add_argument('--data_prefetch_gpu_num', type=int,
-      help='If nonnegative, prefetch examples to this GPU (Tensorflow device num)')
+def preview(args):
+    print("Preview mode")
+    # Implement preview logic here
+    pass
 
-  wavegan_args = parser.add_argument_group('WaveGAN')
-  wavegan_args.add_argument('--wavegan_latent_dim', type=int,
-      help='Number of dimensions of the latent space')
-  wavegan_args.add_argument('--wavegan_kernel_len', type=int,
-      help='Length of 1D filter kernels')
-  wavegan_args.add_argument('--wavegan_dim', type=int,
-      help='Dimensionality multiplier for model of G and D')
-  wavegan_args.add_argument('--wavegan_batchnorm', action='store_true', dest='wavegan_batchnorm',
-      help='Enable batchnorm')
-  wavegan_args.add_argument('--wavegan_disc_nupdates', type=int,
-      help='Number of discriminator updates per generator update')
-  wavegan_args.add_argument('--wavegan_loss', type=str, choices=['dcgan', 'lsgan', 'wgan', 'wgan-gp'],
-      help='Which GAN loss to use')
-  wavegan_args.add_argument('--wavegan_genr_upsample', type=str, choices=['zeros', 'nn'],
-      help='Generator upsample strategy')
-  wavegan_args.add_argument('--wavegan_genr_pp', action='store_true', dest='wavegan_genr_pp',
-      help='If set, use post-processing filter')
-  wavegan_args.add_argument('--wavegan_genr_pp_len', type=int,
-      help='Length of post-processing filter for DCGAN')
-  wavegan_args.add_argument('--wavegan_disc_phaseshuffle', type=int,
-      help='Radius of phase shuffle operation')
+def incept(args):
+    print("Inception score evaluation mode")
+    # Implement inception evaluation here
+    pass
 
-  train_args = parser.add_argument_group('Train')
-  train_args.add_argument('--train_batch_size', type=int,
-      help='Batch size')
-  train_args.add_argument('--train_save_secs', type=int,
-      help='How often to save model')
-  train_args.add_argument('--train_summary_secs', type=int,
-      help='How often to report summaries')
+def infer(args):
+    print("Inference mode")
+    # Implement inference here
+    pass
 
-  preview_args = parser.add_argument_group('Preview')
-  preview_args.add_argument('--preview_n', type=int,
-      help='Number of samples to preview')
+def main():
+    import argparse
 
-  incept_args = parser.add_argument_group('Incept')
-  incept_args.add_argument('--incept_metagraph_fp', type=str,
-      help='Inference model for inception score')
-  incept_args.add_argument('--incept_ckpt_fp', type=str,
-      help='Checkpoint for inference model')
-  incept_args.add_argument('--incept_n', type=int,
-      help='Number of generated examples to test')
-  incept_args.add_argument('--incept_k', type=int,
-      help='Number of groups to test')
+    parser = argparse.ArgumentParser()
 
-  parser.set_defaults(
-    data_dir=None,
-    data_sample_rate=16000,
-    data_slice_len=16384,
-    data_num_channels=1,
-    data_overlap_ratio=0.,
-    data_first_slice=False,
-    data_pad_end=False,
-    data_normalize=False,
-    data_fast_wav=False,
-    data_prefetch_gpu_num=0,
-    wavegan_latent_dim=100,
-    wavegan_kernel_len=25,
-    wavegan_dim=64,
-    wavegan_batchnorm=False,
-    wavegan_disc_nupdates=5,
-    wavegan_loss='wgan-gp',
-    wavegan_genr_upsample='zeros',
-    wavegan_genr_pp=False,
-    wavegan_genr_pp_len=512,
-    wavegan_disc_phaseshuffle=2,
-    train_batch_size=64,
-    train_save_secs=300,
-    train_summary_secs=120,
-    preview_n=32,
-    incept_metagraph_fp='./eval/inception/infer.meta',
-    incept_ckpt_fp='./eval/inception/best_acc-103005',
-    incept_n=5000,
-    incept_k=10)
+    parser.add_argument('mode', type=str, choices=['train', 'preview', 'incept', 'infer'])
+    parser.add_argument('train_dir', type=str, help='Training directory')
 
-  args = parser.parse_args()
+    data_args = parser.add_argument_group('Data')
+    data_args.add_argument('--data_dir', type=str, help='Data directory containing *only* audio files to load')
+    data_args.add_argument('--data_sample_rate', type=int, help='Number of audio samples per second')
+    data_args.add_argument('--data_slice_len', type=int, choices=[16384, 32768, 65536], help='Number of audio samples per slice (maximum generation length)')
+    data_args.add_argument('--data_num_channels', type=int, help='Number of audio channels to generate (for >2, must match that of data)')
+    data_args.add_argument('--data_overlap_ratio', type=float, help='Overlap ratio [0, 1) between slices')
+    data_args.add_argument('--data_first_slice', action='store_true', help='If set, only use the first slice each audio example')
+    data_args.add_argument('--data_pad_end', action='store_true', help='If set, use zero-padded partial slices from the end of each audio file')
+    data_args.add_argument('--data_normalize', action='store_true', help='If set, normalize the training examples')
+    data_args.add_argument('--data_fast_wav', action='store_true', help='Use scipy decoding for WAV files (faster)')
+    data_args.add_argument('--data_prefetch_gpu_num', type=int, help='If nonnegative, prefetch examples to this GPU')
 
-  # Make train dir
-  if not os.path.isdir(args.train_dir):
-    os.makedirs(args.train_dir)
+    wavegan_args = parser.add_argument_group('WaveGAN')
+    wavegan_args.add_argument('--wavegan_latent_dim', type=int, help='Number of dimensions of the latent space')
+    wavegan_args.add_argument('--wavegan_kernel_len', type=int, help='Length of 1D filter kernels')
+    wavegan_args.add_argument('--wavegan_dim', type=int, help='Dimensionality multiplier for model of G and D')
+    wavegan_args.add_argument('--wavegan_batchnorm', action='store_true', help='Enable batchnorm')
+    wavegan_args.add_argument('--wavegan_disc_nupdates', type=int, help='Number of discriminator updates per generator update')
+    wavegan_args.add_argument('--wavegan_loss', type=str, choices=['dcgan', 'lsgan', 'wgan', 'wgan-gp'], help='Which GAN loss to use')
+    wavegan_args.add_argument('--wavegan_genr_upsample', type=str, choices=['zeros', 'nn'], help='Generator upsample strategy')
+    wavegan_args.add_argument('--wavegan_genr_pp', action='store_true', help='If set, use post-processing filter')
+    wavegan_args.add_argument('--wavegan_genr_pp_len', type=int, help='Length of post-processing filter for DCGAN')
+    wavegan_args.add_argument('--wavegan_disc_phaseshuffle', type=int, help='Radius of phase shuffle operation')
 
-  # Save args
-  with open(os.path.join(args.train_dir, 'args.txt'), 'w') as f:
-    f.write('\n'.join([str(k) + ',' + str(v) for k, v in sorted(vars(args).items(), key=lambda x: x[0])]))
+    train_args = parser.add_argument_group('Train')
+    train_args.add_argument('--train_batch_size', type=int, help='Batch size')
+    train_args.add_argument('--train_save_secs', type=int, help='How often to save model')
+    train_args.add_argument('--train_summary_secs', type=int, help='How often to report summaries')
 
-  # Make model kwarg dicts
-  setattr(args, 'wavegan_g_kwargs', {
-    'slice_len': args.data_slice_len,
-    'nch': args.data_num_channels,
-    'kernel_len': args.wavegan_kernel_len,
-    'dim': args.wavegan_dim,
-    'use_batchnorm': args.wavegan_batchnorm,
-    'upsample': args.wavegan_genr_upsample
-  })
-  setattr(args, 'wavegan_d_kwargs', {
-    'kernel_len': args.wavegan_kernel_len,
-    'dim': args.wavegan_dim,
-    'use_batchnorm': args.wavegan_batchnorm,
-    'phaseshuffle_rad': args.wavegan_disc_phaseshuffle
-  })
+    preview_args = parser.add_argument_group('Preview')
+    preview_args.add_argument('--preview_n', type=int, help='Number of samples to preview')
 
-  if args.mode == 'train':
-    fps = glob.glob(os.path.join(args.data_dir, '*'))
-    if len(fps) == 0:
-      raise Exception('Did not find any audio files in specified directory')
-    print('Found {} audio files in specified directory'.format(len(fps)))
-    infer(args)
-    train(fps, args)
-  elif args.mode == 'preview':
-    preview(args)
-  elif args.mode == 'incept':
-    incept(args)
-  elif args.mode == 'infer':
-    infer(args)
-  else:
-    raise NotImplementedError()
+    incept_args = parser.add_argument_group('Incept')
+    incept_args.add_argument('--incept_metagraph_fp', type=str, help='Inference model for inception score')
+    incept_args.add_argument('--incept_ckpt_fp', type=str, help='Checkpoint for inference model')
+    incept_args.add_argument('--incept_n', type=int, help='Number of generated examples to test')
+    incept_args.add_argument('--incept_k', type=int, help='Number of groups to test')
+
+    parser.set_defaults(
+        data_dir=None,
+        data_sample_rate=16000,
+        data_slice_len=16384,
+        data_num_channels=1,
+        data_overlap_ratio=0.,
+        data_first_slice=False,
+        data_pad_end=False,
+        data_normalize=False,
+        data_fast_wav=False,
+        data_prefetch_gpu_num=0,
+        wavegan_latent_dim=100,
+        wavegan_kernel_len=25,
+        wavegan_dim=64,
+        wavegan_batchnorm=False,
+        wavegan_disc_nupdates=5,
+        wavegan_loss='wgan-gp',
+        wavegan_genr_upsample='zeros',
+        wavegan_genr_pp=False,
+        wavegan_genr_pp_len=512,
+        wavegan_disc_phaseshuffle=2,
+        train_batch_size=128,
+        train_save_secs=60*15,
+        train_summary_secs=360,
+        preview_n=32,
+        incept_metagraph_fp='./eval/inception/infer.meta',
+        incept_ckpt_fp='./eval/inception/best_acc-103005',
+        incept_n=5000,
+        incept_k=10)
+
+    args = parser.parse_args()
+
+    # Make train dir if it doesn't exist
+    if not os.path.isdir(args.train_dir):
+        os.makedirs(args.train_dir)
+
+    # Save args to a file
+    with open(os.path.join(args.train_dir, 'args.txt'), 'w') as f:
+        for k, v in sorted(vars(args).items()):
+            f.write(f"{k},{v}\n")
+
+    # Set model kwargs on args
+    args.wavegan_g_kwargs = {
+        'slice_len': args.data_slice_len,
+        'nch': args.data_num_channels,
+        'kernel_len': args.wavegan_kernel_len,
+        'dim': args.wavegan_dim,
+        'use_batchnorm': args.wavegan_batchnorm,
+        'upsample': args.wavegan_genr_upsample
+    }
+    args.wavegan_d_kwargs = {
+        'kernel_len': args.wavegan_kernel_len,
+        'dim': args.wavegan_dim,
+        'use_batchnorm': args.wavegan_batchnorm,
+        'phaseshuffle_rad': args.wavegan_disc_phaseshuffle
+    }
+
+    # Eager execution is enabled by default in TF2; no need to disable it.
+
+    if args.mode == 'train':
+        fps = glob.glob(os.path.join(args.data_dir, '*'))
+        if len(fps) == 0:
+            raise Exception('Did not find any audio files in specified directory')
+        print(f'Found {len(fps)} audio files in specified directory')
+        infer(args)
+        train(fps, args)
+    elif args.mode == 'preview':
+        preview(args)
+    elif args.mode == 'incept':
+        incept(args)
+    elif args.mode == 'infer':
+        infer(args)
+    else:
+        raise NotImplementedError(f"Mode {args.mode} not implemented")
