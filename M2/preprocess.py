@@ -183,41 +183,175 @@ class CatMeowDataset(Dataset):
         return mel_spec
 
 # Text dataset for intent classifier
+import pandas as pd
+import os
+from sklearn.model_selection import train_test_split
 
-def prepare_training_data(dataset_path, output_path):
-    """Complete data preparation pipeline"""
+def create_text_emotion_dataset(csv_file_path):
+    """Load existing text-emotion pairs from CSV file"""
+    try:
+        # Load your existing dataset
+        df = pd.read_csv(csv_file_path)
+        
+        # Rename columns to match expected format
+        df = df.rename(columns={'intent': 'emotion'})
+        
+        # Use predefined emotion mapping to match preprocessing
+        emotion_mapping = {
+            'fear': 0,
+            'joy': 1,
+            'anticipation/demanding': 2,
+            'neutral': 3
+        }
+        
+        # Check if all emotions in dataset are in mapping
+        unique_emotions = df['emotion'].unique()
+        unmapped_emotions = [e for e in unique_emotions if e not in emotion_mapping]
+        if unmapped_emotions:
+            print(f"Warning: Found unmapped emotions: {unmapped_emotions}")
+            print("These will be assigned NaN emotion_id values")
+        
+        # Add emotion IDs
+        df['emotion_id'] = df['emotion'].map(emotion_mapping)
+        
+        # Remove rows with unmapped emotions (NaN emotion_id)
+        original_len = len(df)
+        df = df.dropna(subset=['emotion_id'])
+        df['emotion_id'] = df['emotion_id'].astype(int)
+        
+        if len(df) < original_len:
+            print(f"Removed {original_len - len(df)} rows with unmapped emotions")
+        
+        print(f"Loaded {len(df)} text-emotion pairs")
+        print(f"Available emotions: {list(emotion_mapping.keys())}")
+        
+        return df, emotion_mapping
+        
+    except FileNotFoundError:
+        print(f"Error: Could not find file {csv_file_path}")
+        return None, None
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        return None, None
+
+def create_text_emotion_dataset_combined(csv_file_path=None):
+    """Create text-emotion dataset with option to load from file or use hardcoded data"""
     
+    if csv_file_path and os.path.exists(csv_file_path):
+        # Load from existing CSV
+        return create_text_emotion_dataset(csv_file_path)
+    
+    else:
+        # Fallback to original hardcoded data
+        text_data = [
+            # Fear/Scared
+            ("I'm scared", "fear"),
+            ("Help me", "fear"),
+            ("I'm afraid", "fear"),
+            ("Something's wrong", "fear"),
+            ("I don't feel safe", "fear"),
+            ("There's danger", "fear"),
+            ("I'm worried", "fear"),
+            ("Hide me", "fear"),
+            
+            # Joy/Happy
+            ("I'm so happy", "joy"),
+            ("Let's play", "joy"),
+            ("I love you", "joy"),
+            ("This is fun", "joy"),
+            ("I'm excited", "joy"),
+            ("Play with me", "joy"),
+            ("I'm feeling great", "joy"),
+            ("Time to run around", "joy"),
+            
+            # Anticipation/Demanding
+            ("I'm hungry", "anticipation/demanding"),
+            ("Feed me now", "anticipation/demanding"),
+            ("Where's my food", "anticipation/demanding"),
+            ("I want to eat", "anticipation/demanding"),
+            ("Give me treats", "anticipation/demanding"),
+            ("My bowl is empty", "anticipation/demanding"),
+            ("I'm starving", "anticipation/demanding"),
+            ("Dinner time", "anticipation/demanding"),
+            ("Look at me", "anticipation/demanding"),
+            ("Pet me please", "anticipation/demanding"),
+            ("I want attention", "anticipation/demanding"),
+            ("Notice me", "anticipation/demanding"),
+            ("Come here", "anticipation/demanding"),
+            ("I need cuddles", "anticipation/demanding"),
+            ("Don't ignore me", "anticipation/demanding"),
+            ("Spend time with me", "anticipation/demanding"),
+            
+            # Neutral
+            ("I'm comfortable", "neutral"),
+            ("Life is good", "neutral"),
+            ("I'm relaxed", "neutral"),
+            ("This is nice", "neutral"),
+            ("I'm at peace", "neutral"),
+            ("Everything's perfect", "neutral"),
+            ("I'm satisfied", "neutral"),
+            ("So cozy", "neutral"),
+        ]
+        
+        # Create DataFrame
+        df = pd.DataFrame(text_data, columns=['text', 'emotion'])
+        
+        # Add emotion IDs using predefined mapping
+        emotion_mapping = {
+            'fear': 0,
+            'joy': 1,
+            'anticipation/demanding': 2,
+            'neutral': 3
+        }
+        
+        df['emotion_id'] = df['emotion'].map(emotion_mapping)
+        return df, emotion_mapping
+
+def prepare_training_data(dataset_path, output_path, text_csv_path=None):
+    """Complete data preparation pipeline"""
     print("Step 1: Preparing cat meow audio dataset...")
     preprocessor = CatMeowDatasetPreprocessor(dataset_path, output_path)
     mel_specs, emotion_labels = preprocessor.prepare_dataset()
     
     print("\nStep 2: Creating text-emotion dataset...")
-    text_df = create_text_emotion_dataset()
-    text_df.to_csv(os.path.join(output_path, 'text_emotion_dataset.csv'), index=False)
+    text_df, emotion_mapping = create_text_emotion_dataset_combined(text_csv_path)
+    
+    if text_df is not None:
+        # Save the processed dataset
+        output_csv_path = os.path.join(output_path, 'text_emotion_dataset.csv')
+        text_df.to_csv(output_csv_path, index=False)
+        print(f"Text-emotion dataset saved to: {output_csv_path}")
+        
+        # Also save emotion mapping for later use
+        mapping_path = os.path.join(output_path, 'emotion_mapping.txt')
+        with open(mapping_path, 'w') as f:
+            for emotion, idx in emotion_mapping.items():
+                f.write(f"{emotion}: {idx}\n")
     
     print("\nStep 3: Creating train/validation splits...")
-    
     # Split audio data
     mel_train, mel_val, emotion_train, emotion_val = train_test_split(
         mel_specs, emotion_labels, test_size=0.2, random_state=42, stratify=emotion_labels
     )
     
-    # Save splits
-    np.save(os.path.join(output_path, 'mel_train.npy'), mel_train)
-    np.save(os.path.join(output_path, 'mel_val.npy'), mel_val)
-    np.save(os.path.join(output_path, 'emotion_train.npy'), emotion_train)
-    np.save(os.path.join(output_path, 'emotion_val.npy'), emotion_val)
+    # Split text data if available
+    if text_df is not None:
+        text_train, text_val = train_test_split(
+            text_df, test_size=0.2, random_state=42, stratify=text_df['emotion']
+        )
+        
+        # Save text splits
+        text_train.to_csv(os.path.join(output_path, 'text_train.csv'), index=False)
+        text_val.to_csv(os.path.join(output_path, 'text_val.csv'), index=False)
     
-    # Split text data
-    text_train, text_val = train_test_split(text_df, test_size=0.2, random_state=42, stratify=text_df['emotion'])
-    text_train.to_csv(os.path.join(output_path, 'text_train.csv'), index=False)
-    text_val.to_csv(os.path.join(output_path, 'text_val.csv'), index=False)
-    
-    print("Data preparation completed!")
-    print(f"Training samples: {len(mel_train)} audio, {len(text_train)} text")
-    print(f"Validation samples: {len(mel_val)} audio, {len(text_val)} text")
+    return mel_train, mel_val, emotion_train, emotion_val, text_df
+# Usage example:
+# For using your existing CSV file:
+# prepare_training_data(dataset_path, output_path, text_csv_path="path/to/your/dataset.csv")
 
-# Usage example
+# For using hardcoded data (original behavior):
+# prepare_training_data(dataset_path, output_path)
+
 if __name__ == "__main__":
     # Adjust these paths to your dataset
     dataset_path = "/content/drive/MyDrive/CatMeowsDataset/raw_audio"  # Your organized cat meow folders
